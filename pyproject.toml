@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insta360-to-bag"
+version = "1.0.0"
+description = "Convert Insta360 .insv captures into ROS 2 MCAP bags"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "mcap>=1.1",
+    "mcap-ros2-support>=0.5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+insta360-to-bag = "insta360_to_bag.cli:main"
+
+[tool.setuptools]
+packages = ["insta360_to_bag"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# A sourced ROS environment puts its own pytest plugins on PYTHONPATH, and they
+# pull in dependencies this project does not need. "-p no:" is a no-op when the
+# plugin is absent, so this is safe on a machine without ROS.
+addopts = "-p no:launch -p no:launch_testing -p no:launch_testing_ros"
