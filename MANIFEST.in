@@ -1,0 +1,3 @@
+# setuptools' automatic sdist include picks up tests/test_*.py but not conftest.py,
+# which holds the fixtures they need; without this, tests unpacked from the sdist fail.
+include tests/conftest.py

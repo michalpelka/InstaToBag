@@ -12,11 +12,18 @@ rather than to wrong values when a firmware revision differs.
 ## Install
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e .
+pip install insta360-to-bag
 ```
 
-`ffmpeg` and `ffprobe` must be on `PATH` (`sudo apt install ffmpeg`). No ROS
+Or from a checkout, for development:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e '.[test]'
+```
+
+`ffmpeg` and `ffprobe` must be on `PATH` (`sudo apt install ffmpeg`) — pip cannot
+install those, and the converter exits with a clear message if they are missing. No ROS
 installation is needed — message schemas are embedded in the bag, so the converter
 runs anywhere and the resulting file is self-describing.
 
@@ -218,3 +225,11 @@ pytest plugins, clear `PYTHONPATH` for the run: `env PYTHONPATH= .venv/bin/pytho
 ## License
 
 MIT
+
+## Trademarks
+
+This is an independent project, not affiliated with, endorsed by, or sponsored by
+Arashi Vision Inc. "Insta360" and the product names above are trademarks of their
+respective owners, used here only to identify the file format and hardware this tool
+interoperates with. No Insta360 source code, SDK or firmware is included: the trailer
+format was derived by observing captures from a camera the author owns.

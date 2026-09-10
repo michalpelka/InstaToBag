@@ -8,3 +8,5 @@ __pycache__/
 # Sample captures are large binaries; tests skip themselves when absent.
 *.insv
 *.insp
+dist/
+build/

@@ -1,14 +1,32 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "insta360-to-bag"
-version = "1.0.0"
 description = "Convert Insta360 .insv captures into ROS 2 MCAP bags"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Michał Pełka", email = "michal.pelka@robotec.ai" }]
+keywords = ["insta360", "insv", "ros2", "mcap", "rosbag", "imu", "fisheye"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Typing :: Typed",
+]
+dynamic = ["version"]
 dependencies = [
     "mcap>=1.1",
     "mcap-ros2-support>=0.5",
@@ -17,15 +35,31 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=7"]
 
+[project.urls]
+Homepage = "https://github.com/michalpelka/Insta360ToBag"
+Source = "https://github.com/michalpelka/Insta360ToBag"
+Issues = "https://github.com/michalpelka/Insta360ToBag/issues"
+
 [project.scripts]
 insta360-to-bag = "insta360_to_bag.cli:main"
 
 [tool.setuptools]
 packages = ["insta360_to_bag"]
 
+# Ships the marker that makes the "Typing :: Typed" classifier real: without
+# it in the wheel, type checkers ignore this package's annotations.
+[tool.setuptools.package-data]
+insta360_to_bag = ["py.typed"]
+
+# Single source of truth for the version: insta360_to_bag.__version__.
+[tool.setuptools.dynamic]
+version = { attr = "insta360_to_bag.__version__" }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # A sourced ROS environment puts its own pytest plugins on PYTHONPATH, and they
-# pull in dependencies this project does not need. "-p no:" is a no-op when the
+# pull in dependencies this project does not need. These are the pytest11
+# entry-point names ROS installs, not the package names: launch_pytest and
+# launch_ros, not "launch" or "launch_testing_ros". "-p no:" is a no-op when the
 # plugin is absent, so this is safe on a machine without ROS.
-addopts = "-p no:launch -p no:launch_testing -p no:launch_testing_ros"
+addopts = "-p no:launch_pytest -p no:launch_testing -p no:launch_ros"

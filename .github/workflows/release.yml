@@ -1,0 +1,64 @@
+name: Release
+
+# Publishes to PyPI when a version tag is pushed (e.g. `git tag v1.0.0 && git push origin v1.0.0`),
+# and on a manual dispatch for a dry run that builds and checks without uploading.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Run tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]'
+          pytest
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check --strict dist/*
+
+      # The tag must match insta360_to_bag.__version__, or the release goes out
+      # under a version number nothing in the package agrees with.
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(python -c 'import insta360_to_bag; print(insta360_to_bag.__version__)')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $tag != __version__ $pkg" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # mints the OIDC token PyPI trusted publishing verifies
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
