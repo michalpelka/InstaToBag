@@ -10,7 +10,7 @@ from typing import List, Optional
 
 from . import media, metadata as metadata_mod, sensors, trailer as trailer_mod
 from .calibration import summarise
-from .convert import COMPRESSION, Options, convert, resolve_scale
+from .convert import COMPRESSION, DEFAULT_CAMERA_RPY, Options, convert, resolve_scale
 
 DESCRIPTION = """\
 Convert an Insta360 .insv capture into a ROS 2 MCAP bag.
@@ -72,11 +72,31 @@ def build_parser() -> argparse.ArgumentParser:
         ("exposure", "per-frame exposure time"),
         ("preview", "the embedded equirectangular preview image"),
         ("audio", "the audio track"),
+        ("tf", "the static lidar-to-camera transforms on /tf_static"),
     ):
         group.add_argument(
             f"--no-{name}", dest=name.replace("-", "_"), action="store_false",
             help=f"leave out {help_text}",
         )
+
+    group = parser.add_argument_group("extrinsics")
+    group.add_argument(
+        "--lidar-frame", default="lidar", metavar="FRAME",
+        help="parent frame of the static camera transforms; default lidar",
+    )
+    group.add_argument(
+        "--camera-xyz", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+        metavar=("X", "Y", "Z"),
+        help="camera centre in the lidar frame, in metres; default 0 0 0",
+    )
+    group.add_argument(
+        "--camera-rpy", type=float, nargs=3, default=list(DEFAULT_CAMERA_RPY),
+        metavar=("ROLL", "PITCH", "YAW"),
+        help="camera body orientation in the lidar frame, as URDF fixed-axis roll pitch "
+             "yaw in degrees; body x is the front lens's view, z the lens end. Default "
+             "90 0 -90: on its side, lens end toward -x, front lens looking right. "
+             "Upright with the front lens looking right is 0 0 -90",
+    )
 
     group = parser.add_argument_group("output format")
     group.add_argument(
@@ -187,7 +207,12 @@ def _inspect(path: str) -> int:
             print("calibration (rescaled to the stored frame size)")
             for lens in meta.lenses:
                 print(f"  {summarise(lens)}")
-                print(f"    distortion {lens.distortion}")
+                print(f"    unified k1 k2 k3 p1 p2 {lens.distortion}")
+                print(f"    published as equidistant fx={lens.equidistant_fx:.2f} "
+                      f"fy={lens.equidistant_fy:.2f} "
+                      f"k1..k4 {[round(c, 8) for c in lens.equidistant]}")
+                print(f"    fit within {lens.fit_error_px:.2f} px out to "
+                      f"{lens.fit_max_angle_deg:.1f} deg off-axis")
 
         problems = trailer.footer_mismatches()
         if problems:
@@ -231,6 +256,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             resolve_scale(args.scale, 100, 100)
         except ValueError as exc:
             parser.error(str(exc))
+    if not args.lidar_frame or args.lidar_frame.startswith("/"):
+        parser.error("--lidar-frame must be a non-empty frame id without a leading '/'")
 
     options = Options(
         input_path=args.input,
@@ -249,7 +276,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         include_exposure=args.exposure,
         include_preview=args.preview,
         include_audio=args.audio,
+        include_tf=args.tf,
         audio_chunk_samples=args.audio_chunk_samples,
+        lidar_frame=args.lidar_frame,
+        camera_xyz=tuple(args.camera_xyz),
+        camera_rpy=tuple(args.camera_rpy),
     )
 
     log = (lambda _: None) if args.quiet else (lambda message: print(message, flush=True))

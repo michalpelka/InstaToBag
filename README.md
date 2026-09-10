@@ -51,7 +51,10 @@ Run `insta360-to-bag --help` for the full set. The useful ones:
 | `--scale SPEC` | `0.5` or `1440x1440`. Intrinsics are rescaled to match. |
 | `--max-frames N` | Stop after N frames. |
 | `--swap-lenses` | Map the second video track to `cam_front`. |
-| `--no-{video,camera-info,imu,exposure,preview,audio}` | Leave a stream out. |
+| `--no-{video,camera-info,imu,exposure,preview,audio,tf}` | Leave a stream out. |
+| `--camera-xyz X Y Z` | Camera centre in the lidar frame, metres. Default `0 0 0`. |
+| `--camera-rpy R P Y` | Camera body orientation in the lidar frame, URDF roll/pitch/yaw in degrees. Default `90 0 -90`. |
+| `--lidar-frame FRAME` | Parent frame of the camera transforms. Default `lidar`. |
 | `--relative-time` | Start timestamps at zero instead of the capture wall clock. |
 | `--compression {zstd,lz4,none}` | MCAP chunk compression. Default `zstd`. |
 | `--topic-prefix` | Default `/insta360`. |
@@ -69,9 +72,11 @@ Run `insta360-to-bag --help` for the full set. The useful ones:
 | `/insta360/preview/image` | `sensor_msgs/msg/Image` (rgb8 equirect) | once |
 | `/insta360/audio` | `audio_common_msgs/msg/AudioData` (PCM s16le) | 24 Hz |
 | `/insta360/metadata` | `std_msgs/msg/String` (JSON) | once |
+| `/tf_static` | `tf2_msgs/msg/TFMessage` (transient-local QoS) | once |
 
 Messages are written in strict time order, and each message's `header.stamp` equals its
-MCAP log time.
+MCAP log time. `/tf_static` is never put under `--topic-prefix`, because tf listeners
+only subscribe to that exact name.
 
 A 15.6 s 5.7K clip becomes roughly 350 MB at the default JPEG quality; conversion is
 bounded by HEVC decode of two 2880×2880 tracks.
@@ -79,7 +84,31 @@ bounded by HEVC decode of two 2880×2880 tracks.
 ### Frames
 
 `insta360_cam_front_optical_frame`, `insta360_cam_back_optical_frame`, `insta360_imu`.
-No transform between them is published — see the caveats below.
+
+`/tf_static` carries one transform from the lidar frame (`--lidar-frame`, default
+`lidar`, REP 103 x-forward / y-left / z-up) to each lens's optical frame (z along the
+viewing direction, x to image right, y to image down), built from two parts:
+
+- **Lens in body.** The body frame is REP 103 for the camera itself: x along
+  `cam_front`'s view, y to its left, z out of the top (the lens end). The stored frames
+  are upright relative to the body — image down points toward the camera's base.
+- **Body in lidar**, set by `--camera-xyz X Y Z` (metres) and `--camera-rpy R P Y`
+  (URDF fixed-axis roll/pitch/yaw, degrees). Both lenses sit at the body's position.
+
+The default `--camera-rpy 90 0 -90` is the rig this was developed on, which carries the
+camera **on its side**: lens end toward the lidar's −x, **`cam_front` looking right**
+and **`cam_back` looking left** — which is why its frames show the world sideways. For
+an upright camera looking the same way, pass `--camera-rpy 0 0 -90`. With the default:
+
+| Child frame | Looks along | Image right | Image down | Rotation from the lidar frame (x, y, z, w) |
+| --- | --- | --- | --- | --- |
+| `insta360_cam_back_optical_frame` | +y (left) | +z (up) | +x (forward) | (−0.5, −0.5, −0.5, 0.5) |
+| `insta360_cam_front_optical_frame` | −y (right) | −z (down) | +x (forward) | (0.5, 0.5, −0.5, 0.5) |
+
+The calibration's own per-lens angles are not applied: they are expressed in Insta360's
+stitching frame, whose conventions are not established (its `rz ≈ 90°` is not a
+physical sensor roll). If the lenses are the wrong way round use `--swap-lenses`; to
+publish your own transforms instead, pass `--no-tf`. `insta360_imu` has no transform — see the caveats below.
 
 ## Read it back
 
@@ -109,18 +138,30 @@ the tool deliberately preserves raw values instead of guessing.
   y-left / z-up convention, because the mapping from the X-series sensor frame to the
   camera body frame is undocumented. Determine it for your rig before fusing.
 - **No IMU-to-camera extrinsics.** The metadata carries per-lens rotations, but not a
-  calibrated IMU-to-camera transform, so no `tf` is emitted. The per-lens rotation and
-  translation values are passed through on the metadata topic.
-- **The distortion model is Insta360's, not OpenCV's.** `CameraInfo.distortion_model`
-  is set to `insta360_fisheye_v2` and `d` holds the camera's own five coefficients.
-  They are *not* `plumb_bob` or `equidistant` and must not be fed to
-  `cv::undistort`/`cv::fisheye` as if they were. `K` and `P` are ordinary pinhole
-  intrinsics and are safe to use. The raw calibration strings are republished verbatim
-  on `/insta360/metadata`.
+  calibrated IMU-to-camera transform, so `insta360_imu` is left out of `/tf_static`.
+  The per-lens rotation and translation values are passed through on the metadata
+  topic.
+- **Lidar-to-camera transforms are nominal, not calibrated.** The pose is whatever
+  `--camera-xyz` and `--camera-rpy` say (by default the side mount described under
+  Frames, at the lidar origin), and both lenses share one position — the few
+  centimetres from each lens's optical centre to the body centre are not applied.
+  Calibrate the rig if you need better than that.
+- **CameraInfo is an `equidistant` fit, not the camera's own model.** The camera
+  calibrates each lens with the unified (Mei) omnidirectional model — OpenCV's
+  `omnidir`: ξ = 2, radial k1–k3, tangential p1, p2 — which ROS does not define.
+  `CameraInfo` therefore carries `distortion_model: equidistant` (Kannala–Brandt, what
+  `cv::fisheye` and `image_proc` use), with `d` = k1–k4 fitted to the unified model and
+  `K`/`P` built on the equivalent focal length fx / (1 + ξ). Radially the two agree to
+  about 0.3 px out to the rim of the image circle; the tangential terms have no
+  equidistant counterpart, and dropping them costs up to ~2 px on the front lens and
+  ~4 px on the back one at the rim, at full resolution. `--inspect` prints the fit and
+  its error for your file. The unified parameters are on `/insta360/metadata`, next to
+  the raw calibration strings. A pinhole rectification can show at most the central
+  < 180° of a ~200° lens.
 - **`cam_front` / `cam_back` is naming, not a determination.** They follow the order of
   the video tracks in the file, which is stable but has not been confirmed against
   which lens physically faces the screen. Use `--swap-lenses` if you need them the
-  other way round.
+  other way round — that also swaps which lens `/tf_static` puts on the left.
 - **JPEG re-encode is lossy.** Frames are decoded from HEVC and re-encoded as JPEG.
   Lower `--jpeg-quality` for more fidelity, or keep the original file for archival.
 - **IMU covariances are unknown.** They are left as zeros, which `sensor_msgs/Imu`
@@ -201,7 +242,7 @@ checks. `--inspect` prints the mean magnitude so you can confirm it on your own 
 .venv/bin/python -m pytest
 ```
 
-138 tests. Format parsers are tested against byte-exact synthetic trailers and
+167 tests. Format parsers are tested against byte-exact synthetic trailers and
 protobuf messages rather than mocks, so a change in format understanding fails a test.
 Tests that need the sample capture or `ffmpeg` skip themselves when either is absent.
 
@@ -215,7 +256,7 @@ pytest plugins, clear `PYTHONPATH` for the run: `env PYTHONPATH= .venv/bin/pytho
 | `trailer.py` | Trailer tail, record directory, random access to records |
 | `protobuf.py` | Dependency-free protobuf wire decoder (the camera ships no schema) |
 | `metadata.py` | Typed view over record `0x0101`, including the wall-clock mapping |
-| `calibration.py` | Lens calibration strings → rescaled intrinsics |
+| `calibration.py` | Lens calibration strings → rescaled unified-model intrinsics and their equidistant fit |
 | `sensors.py` | IMU, exposure and preview record decoding |
 | `media.py` | ffmpeg pipes for frames and audio, plus JPEG framing |
 | `msgdefs.py` | Embedded ROS 2 message definitions |

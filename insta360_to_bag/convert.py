@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import heapq
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -23,15 +24,67 @@ COMPRESSION = {
 #: Ordering key for messages that land on the same timestamp, so that a bag is
 #: byte-for-byte reproducible from the same input.
 _PRIORITY_METADATA = 0
-_PRIORITY_CAMERA_INFO = 1
-_PRIORITY_IMAGE = 2
-_PRIORITY_PREVIEW = 3
-_PRIORITY_EXPOSURE = 4
-_PRIORITY_IMU = 5
-_PRIORITY_AUDIO = 6
+_PRIORITY_TF_STATIC = 1
+_PRIORITY_CAMERA_INFO = 2
+_PRIORITY_IMAGE = 3
+_PRIORITY_PREVIEW = 4
+_PRIORITY_EXPOSURE = 5
+_PRIORITY_IMU = 6
+_PRIORITY_AUDIO = 7
 
 #: (topic suffix, frame id suffix) for the two fisheye lenses, in file order.
 LENS_NAMES = ("cam_front", "cam_back")
+
+#: tf listeners only ever subscribe to this exact name, so it is not put under
+#: ``--topic-prefix``.
+TF_STATIC_TOPIC = "/tf_static"
+
+#: Rotation from the camera body frame to each lens's optical frame, as (x, y, z, w).
+#:
+#: The body frame is REP 103 for the camera as a whole: x along the front lens's view,
+#: y to its left, z out of the top of the body (the lens end).  Stored frames are upright
+#: relative to the body -- image down points toward the camera's base -- so with the
+#: optical convention (z along the view, x to image right, y to image down):
+#:
+#:   cam_front: z = +x, x = -y, y = -z
+#:   cam_back:  z = -x, x = +y, y = -z
+#:
+#: The sub-degree lens tilts in the calibration are not applied: they are expressed in
+#: Insta360's own stitching frame, whose axis order and signs are not established.
+BODY_TO_OPTICAL = {
+    "cam_front": (-0.5, 0.5, -0.5, 0.5),
+    "cam_back": (-0.5, -0.5, 0.5, 0.5),
+}
+
+#: How the camera body sits in the lidar frame: fixed-axis roll, pitch, yaw in degrees,
+#: as URDF and tf2 define them.  The default is the rig this was developed on, which
+#: carries the camera on its side: lens end toward the lidar's -x, front lens looking
+#: right (-y), back lens left (+y).  An upright camera with the front lens looking right
+#: is (0, 0, -90).
+DEFAULT_CAMERA_RPY = (90.0, 0.0, -90.0)
+
+#: rosbag2 reads a channel's QoS from this metadata; transient-local durability is what
+#: makes ``ros2 bag play`` latch /tf_static for listeners that start late.  Policies are
+#: the rmw enum values (history 1 = keep_last, reliability 1 = reliable, durability 1 =
+#: transient_local, liveliness 1 = automatic) rather than the names Jazzy writes,
+#: because Humble only parses numbers while Jazzy and Kilted still accept them.
+_LATCHED_QOS_PROFILES = """\
+- history: 1
+  depth: 1
+  reliability: 1
+  durability: 1
+  deadline:
+    sec: 2147483647
+    nsec: 4294967295
+  lifespan:
+    sec: 2147483647
+    nsec: 4294967295
+  liveliness: 1
+  liveliness_lease_duration:
+    sec: 2147483647
+    nsec: 4294967295
+  avoid_ros_namespace_conventions: false
+"""
 
 _ZERO_COVARIANCE = [0.0] * 9
 _UNKNOWN_ORIENTATION_COVARIANCE = [-1.0] + [0.0] * 8
@@ -57,7 +110,14 @@ class Options:
     include_exposure: bool = True
     include_preview: bool = True
     include_audio: bool = True
+    include_tf: bool = True
     audio_chunk_samples: Optional[int] = None
+    #: Parent frame of the static camera transforms.
+    lidar_frame: str = "lidar"
+    #: Camera centre in ``lidar_frame``, in metres.
+    camera_xyz: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    #: Camera body orientation in ``lidar_frame``: roll, pitch, yaw in degrees.
+    camera_rpy: Tuple[float, float, float] = DEFAULT_CAMERA_RPY
 
 
 @dataclass
@@ -282,6 +342,28 @@ def convert(options: Options, log: Callable[[str], None] = lambda _: None) -> Su
             )])
         )
 
+        if options.include_tf and cameras:
+            _register_latched_channel(writer, TF_STATIC_TOPIC, schemas[msgdefs.TF_MESSAGE])
+            tf_time = time_of(origin_us)
+            streams.append(
+                iter([(
+                    tf_time,
+                    _PRIORITY_TF_STATIC,
+                    0,
+                    TF_STATIC_TOPIC,
+                    msgdefs.TF_MESSAGE,
+                    {
+                        "transforms": static_transforms(
+                            [(camera.name, camera.frame_id) for camera in cameras],
+                            tf_time,
+                            options.lidar_frame,
+                            options.camera_xyz,
+                            options.camera_rpy,
+                        )
+                    },
+                )])
+            )
+
         if options.include_imu and imu_samples:
             streams.append(
                 _imu_stream(
@@ -450,12 +532,25 @@ def _metadata_payload(
             "intrinsics": None
             if camera.calibration is None
             else {
-                "fx": camera.calibration.fx,
-                "fy": camera.calibration.fy,
+                # What CameraInfo publishes.
+                "distortion_model": DISTORTION_MODEL,
+                "fx": camera.calibration.equidistant_fx,
+                "fy": camera.calibration.equidistant_fy,
                 "cx": camera.calibration.cx,
                 "cy": camera.calibration.cy,
-                "distortion_model": DISTORTION_MODEL,
-                "distortion": camera.calibration.distortion,
+                "distortion": camera.calibration.equidistant,
+                "fit_max_angle_deg": camera.calibration.fit_max_angle_deg,
+                "fit_error_px": camera.calibration.fit_error_px,
+                # The camera's own model, which the above approximates.
+                "source": {
+                    "model": "unified (Mei) omnidirectional, as OpenCV omnidir",
+                    "xi": camera.calibration.xi,
+                    "fx": camera.calibration.fx,
+                    "fy": camera.calibration.fy,
+                    "cx": camera.calibration.cx,
+                    "cy": camera.calibration.cy,
+                    "k1_k2_k3_p1_p2": camera.calibration.distortion,
+                },
                 "rotation_deg": list(camera.calibration.rotation_deg),
                 "translation": list(camera.calibration.translation),
             },
@@ -463,6 +558,85 @@ def _metadata_payload(
         for camera in cameras
     ]
     return payload
+
+
+def _quaternion_from_rpy(
+    roll: float, pitch: float, yaw: float
+) -> Tuple[float, float, float, float]:
+    """Fixed-axis roll, pitch, yaw in radians to (x, y, z, w), as tf2's ``setRPY``."""
+    cr, sr = math.cos(roll / 2), math.sin(roll / 2)
+    cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
+    cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+def _quaternion_multiply(
+    a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]
+) -> Tuple[float, float, float, float]:
+    """Hamilton product of two (x, y, z, w) quaternions: rotate by ``b``, then ``a``."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def static_transforms(
+    lenses: List[Tuple[str, str]],
+    log_time_ns: int,
+    parent_frame: str,
+    camera_xyz: Tuple[float, float, float],
+    camera_rpy_deg: Tuple[float, float, float],
+) -> List[Dict[str, object]]:
+    """Build a ``geometry_msgs/TransformStamped`` from ``parent_frame`` to each lens.
+
+    ``lenses`` pairs a name from :data:`LENS_NAMES` with its optical frame id.  The
+    camera body sits at ``camera_xyz`` (metres) turned by ``camera_rpy_deg`` in the
+    parent frame, and each lens's rotation is that mount composed with
+    :data:`BODY_TO_OPTICAL`.  Both lenses share the body's position: the offset from
+    each lens's optical centre to the body centre is not in the metadata in metric
+    units, so it is not guessed.
+    """
+    x, y, z = camera_xyz
+    mount = _quaternion_from_rpy(*(math.radians(angle) for angle in camera_rpy_deg))
+    transforms: List[Dict[str, object]] = []
+    for name, frame_id in lenses:
+        qx, qy, qz, qw = _quaternion_multiply(mount, BODY_TO_OPTICAL[name])
+        transforms.append(
+            {
+                "header": _header(log_time_ns, parent_frame),
+                "child_frame_id": frame_id,
+                "transform": {
+                    "translation": {"x": x, "y": y, "z": z},
+                    "rotation": {"x": qx, "y": qy, "z": qz, "w": qw},
+                },
+            }
+        )
+    return transforms
+
+
+def _register_latched_channel(writer: Writer, topic: str, schema: object) -> None:
+    """Register ``topic`` with transient-local QoS before anything is written to it.
+
+    mcap_ros2's Writer registers a channel lazily on its first message and gives it no
+    metadata, which leaves rosbag2 to replay /tf_static as volatile.  So the channel is
+    registered here through the underlying mcap writer and handed to mcap_ros2 by topic
+    name; both are private attributes, and tests/test_tf.py fails if they move.
+    """
+    writer._channel_ids[topic] = writer._writer.register_channel(
+        topic=topic,
+        message_encoding="cdr",
+        schema_id=schema.id,  # type: ignore[attr-defined]
+        metadata={"offered_qos_profiles": _LATCHED_QOS_PROFILES},
+    )
 
 
 def _imu_stream(
@@ -575,7 +749,7 @@ def _video_stream(
                         "height": camera.height,
                         "width": camera.width,
                         "distortion_model": DISTORTION_MODEL,
-                        "d": camera.calibration.distortion,
+                        "d": camera.calibration.equidistant,
                         "k": camera.calibration.k,
                         "r": camera.calibration.r,
                         "p": camera.calibration.p,

@@ -16,9 +16,9 @@ requires_ffmpeg = pytest.mark.skipif(
 def test_content_flags_default_to_on_and_switch_off():
     args = build_parser().parse_args(["in.insv"])
     assert (args.video, args.camera_info, args.imu, args.exposure, args.preview,
-            args.audio) == (True,) * 6
-    args = build_parser().parse_args(["in.insv", "--no-imu", "--no-audio"])
-    assert args.imu is False and args.audio is False
+            args.audio, args.tf) == (True,) * 7
+    args = build_parser().parse_args(["in.insv", "--no-imu", "--no-audio", "--no-tf"])
+    assert args.imu is False and args.audio is False and args.tf is False
     assert args.video is True
 
 
@@ -29,6 +29,33 @@ def test_defaults_match_the_documented_values():
     assert args.jpeg_quality == 3
     assert args.scale is None and args.max_frames is None
     assert args.relative_time is False
+    assert args.lidar_frame == "lidar"
+    assert args.camera_xyz == [0.0, 0.0, 0.0]
+    assert args.camera_rpy == [90.0, 0.0, -90.0]
+
+
+def test_camera_position_accepts_negative_coordinates():
+    args = build_parser().parse_args(["in.insv", "--camera-xyz", "-0.1", "0.2", "-0.35"])
+    assert args.camera_xyz == [-0.1, 0.2, -0.35]
+
+
+def test_camera_orientation_accepts_negative_angles():
+    args = build_parser().parse_args(["in.insv", "--camera-rpy", "0", "-5.5", "-90"])
+    assert args.camera_rpy == [0.0, -5.5, -90.0]
+
+
+def test_camera_position_needs_three_values():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["in.insv", "--camera-xyz", "0.1", "0.2"])
+
+
+@pytest.mark.parametrize("frame", ["", "/lidar"])
+def test_bad_lidar_frame_is_reported_before_any_work(tmp_path, capsys, frame):
+    source = tmp_path / "x.insv"
+    source.write_bytes(b"\x00" * 128)
+    with pytest.raises(SystemExit):
+        main([str(source), "--lidar-frame", frame])
+    assert "--lidar-frame" in capsys.readouterr().err
 
 
 def test_unknown_compression_is_rejected_at_parse_time():

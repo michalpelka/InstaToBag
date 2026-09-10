@@ -99,6 +99,7 @@ def test_every_requested_stream_is_present(converted):
     assert counts["/insta360/metadata"] == 1
     assert counts["/insta360/preview/image"] == 1
     assert counts["/insta360/audio"] >= 1
+    assert counts["/tf_static"] == 1
     assert summary.warnings == []
 
 
@@ -180,16 +181,17 @@ def test_images_are_decodable_jpeg_of_the_expected_size(converted):
 
 @requires_ffmpeg
 @requires_real_capture
-def test_camera_info_matches_the_images_and_carries_a_non_standard_model(converted):
-    from insta360_to_bag.calibration import DISTORTION_MODEL
+def test_camera_info_matches_the_images_and_carries_an_equidistant_model(converted):
     from mcap_ros2.reader import read_ros2_messages
 
     _, path = converted
     for message in read_ros2_messages(path, topics=["/insta360/cam_front/camera_info"]):
         info = message.ros_msg
         assert (info.width, info.height) == (2880, 2880)
-        assert info.distortion_model == DISTORTION_MODEL
-        assert len(info.d) == 5 and len(info.k) == 9 and len(info.p) == 12
+        assert info.distortion_model == "equidistant"
+        assert len(info.d) == 4 and len(info.k) == 9 and len(info.p) == 12
+        # Equidistant focal length is the unified one over (1 + xi), xi = 2 on an X5.
+        assert info.k[0] == pytest.approx(2300 / 3, abs=10)
         assert info.k[2] == pytest.approx(1440, abs=15)  # cx
         assert info.k[5] == pytest.approx(1440, abs=15)  # cy
         assert info.header.frame_id == "insta360_cam_front_optical_frame"
@@ -265,6 +267,7 @@ def test_streams_can_be_switched_off_individually(tmp_path):
             include_exposure=False,
             include_preview=False,
             include_audio=False,
+            include_tf=False,
         )
     )
     assert set(summary.message_counts) == {"/insta360/imu", "/insta360/metadata"}
@@ -335,6 +338,39 @@ def test_swapping_lenses_exchanges_the_two_image_topics(tmp_path):
 
 @requires_ffmpeg
 @requires_real_capture
+def test_tf_static_links_the_lidar_frame_to_both_image_frames(tmp_path):
+    from mcap_ros2.reader import read_ros2_messages
+
+    output = tmp_path / "tf.mcap"
+    convert(
+        Options(
+            input_path=REAL_CAPTURE,
+            output_path=str(output),
+            max_frames=1,
+            jpeg_quality=20,
+            include_audio=False,
+            include_preview=False,
+            include_imu=False,
+            lidar_frame="os_sensor",
+            camera_xyz=(0.05, 0.0, 0.2),
+        )
+    )
+    image_frames = {
+        message.channel.topic: message.ros_msg.header.frame_id
+        for message in read_ros2_messages(str(output))
+        if message.channel.topic.endswith("/image/compressed")
+    }
+    (message,) = list(read_ros2_messages(str(output), topics=["/tf_static"]))
+    transforms = message.ros_msg.transforms
+    assert {t.child_frame_id for t in transforms} == set(image_frames.values())
+    for transform in transforms:
+        assert transform.header.frame_id == "os_sensor"
+        translation = transform.transform.translation
+        assert (translation.x, translation.y, translation.z) == (0.05, 0.0, 0.2)
+
+
+@requires_ffmpeg
+@requires_real_capture
 def test_topic_prefix_is_applied(tmp_path):
     output = tmp_path / "prefixed.mcap"
     summary = convert(
@@ -349,7 +385,13 @@ def test_topic_prefix_is_applied(tmp_path):
             include_audio=False,
         )
     )
-    assert all(topic.startswith("/x5/") for topic in summary.message_counts)
+    # /tf_static is fixed by tf itself, so it is the one topic the prefix does not touch.
+    assert "/tf_static" in summary.message_counts
+    assert all(
+        topic.startswith("/x5/")
+        for topic in summary.message_counts
+        if topic != "/tf_static"
+    )
 
 
 @requires_ffmpeg
