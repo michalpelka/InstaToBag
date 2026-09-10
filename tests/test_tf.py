@@ -75,14 +75,14 @@ def test_yaw_turns_an_upright_camera_to_look_sideways():
 
 
 def test_default_mount_is_the_side_mounted_rig():
-    # On its side with the lens end toward the lidar's -x: world-up is image -x on the
-    # front lens and image +x on the back one, and the rig (lidar-forward) sits at the
+    # On its side with the lens end toward the lidar's +x: world-up is image -x on the
+    # front lens and image +x on the back one, and the rig (lidar-backward) sits at the
     # bottom of both images -- as seen in that rig's own frames.
     axes = _lens_axes(DEFAULT_CAMERA_RPY)
-    assert axes["front"] == {"view": _near((0, -1, 0)), "right": _near((0, 0, -1)),
-                             "down": _near((1, 0, 0))}
-    assert axes["back"] == {"view": _near((0, 1, 0)), "right": _near((0, 0, 1)),
-                            "down": _near((1, 0, 0))}
+    assert axes["front"] == {"view": _near((0, 1, 0)), "right": _near((0, 0, -1)),
+                             "down": _near((-1, 0, 0))}
+    assert axes["back"] == {"view": _near((0, -1, 0)), "right": _near((0, 0, 1)),
+                            "down": _near((-1, 0, 0))}
 
 
 def test_static_transforms_place_both_lenses_at_the_camera_position():

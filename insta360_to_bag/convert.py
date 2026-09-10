@@ -58,10 +58,10 @@ BODY_TO_OPTICAL = {
 
 #: How the camera body sits in the lidar frame: fixed-axis roll, pitch, yaw in degrees,
 #: as URDF and tf2 define them.  The default is the rig this was developed on, which
-#: carries the camera on its side: lens end toward the lidar's -x, front lens looking
-#: right (-y), back lens left (+y).  An upright camera with the front lens looking right
-#: is (0, 0, -90).
-DEFAULT_CAMERA_RPY = (90.0, 0.0, -90.0)
+#: carries the camera on its side: lens end toward the lidar's +x, front lens looking
+#: left (+y), back lens right (-y).  An upright camera with the front lens looking left
+#: is (0, 0, 90).
+DEFAULT_CAMERA_RPY = (90.0, 0.0, 90.0)
 
 #: rosbag2 reads a channel's QoS from this metadata; transient-local durability is what
 #: makes ``ros2 bag play`` latch /tf_static for listeners that start late.  Policies are

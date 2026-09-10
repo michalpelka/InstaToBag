@@ -53,7 +53,7 @@ Run `insta360-to-bag --help` for the full set. The useful ones:
 | `--swap-lenses` | Map the second video track to `cam_front`. |
 | `--no-{video,camera-info,imu,exposure,preview,audio,tf}` | Leave a stream out. |
 | `--camera-xyz X Y Z` | Camera centre in the lidar frame, metres. Default `0 0 0`. |
-| `--camera-rpy R P Y` | Camera body orientation in the lidar frame, URDF roll/pitch/yaw in degrees. Default `90 0 -90`. |
+| `--camera-rpy R P Y` | Camera body orientation in the lidar frame, URDF roll/pitch/yaw in degrees. Default `90 0 90`. |
 | `--lidar-frame FRAME` | Parent frame of the camera transforms. Default `lidar`. |
 | `--relative-time` | Start timestamps at zero instead of the capture wall clock. |
 | `--compression {zstd,lz4,none}` | MCAP chunk compression. Default `zstd`. |
@@ -95,15 +95,15 @@ viewing direction, x to image right, y to image down), built from two parts:
 - **Body in lidar**, set by `--camera-xyz X Y Z` (metres) and `--camera-rpy R P Y`
   (URDF fixed-axis roll/pitch/yaw, degrees). Both lenses sit at the body's position.
 
-The default `--camera-rpy 90 0 -90` is the rig this was developed on, which carries the
-camera **on its side**: lens end toward the lidar's −x, **`cam_front` looking right**
-and **`cam_back` looking left** — which is why its frames show the world sideways. For
-an upright camera looking the same way, pass `--camera-rpy 0 0 -90`. With the default:
+The default `--camera-rpy 90 0 90` is the rig this was developed on, which carries the
+camera **on its side**: lens end toward the lidar's +x, **`cam_front` looking left**
+and **`cam_back` looking right** — which is why its frames show the world sideways. For
+an upright camera looking the same way, pass `--camera-rpy 0 0 90`. With the default:
 
 | Child frame | Looks along | Image right | Image down | Rotation from the lidar frame (x, y, z, w) |
 | --- | --- | --- | --- | --- |
-| `insta360_cam_back_optical_frame` | +y (left) | +z (up) | +x (forward) | (−0.5, −0.5, −0.5, 0.5) |
-| `insta360_cam_front_optical_frame` | −y (right) | −z (down) | +x (forward) | (0.5, 0.5, −0.5, 0.5) |
+| `insta360_cam_front_optical_frame` | +y (left) | −z (down) | −x (backward) | (−0.5, 0.5, 0.5, 0.5) |
+| `insta360_cam_back_optical_frame` | −y (right) | +z (up) | −x (backward) | (0.5, −0.5, 0.5, 0.5) |
 
 The calibration's own per-lens angles are not applied: they are expressed in Insta360's
 stitching frame, whose conventions are not established (its `rz ≈ 90°` is not a

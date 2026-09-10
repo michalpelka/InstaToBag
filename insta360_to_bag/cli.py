@@ -94,8 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("ROLL", "PITCH", "YAW"),
         help="camera body orientation in the lidar frame, as URDF fixed-axis roll pitch "
              "yaw in degrees; body x is the front lens's view, z the lens end. Default "
-             "90 0 -90: on its side, lens end toward -x, front lens looking right. "
-             "Upright with the front lens looking right is 0 0 -90",
+             "90 0 90: on its side, lens end toward +x, front lens looking left. "
+             "Upright with the front lens looking left is 0 0 90",
     )
 
     group = parser.add_argument_group("output format")

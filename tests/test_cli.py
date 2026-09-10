@@ -31,7 +31,7 @@ def test_defaults_match_the_documented_values():
     assert args.relative_time is False
     assert args.lidar_frame == "lidar"
     assert args.camera_xyz == [0.0, 0.0, 0.0]
-    assert args.camera_rpy == [90.0, 0.0, -90.0]
+    assert args.camera_rpy == [90.0, 0.0, 90.0]
 
 
 def test_camera_position_accepts_negative_coordinates():
