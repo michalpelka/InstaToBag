@@ -15,6 +15,22 @@ rather than to wrong values when a firmware revision differs.
 pip install insta360-to-bag
 ```
 
+To run the `insta360-to-bag` command from any directory without activating a
+virtualenv, install it with [pipx](https://pipx.pypa.io/) instead — it puts the CLI on
+your `PATH` in its own isolated environment:
+
+```bash
+pipx install insta360-to-bag
+```
+
+From a checkout, drop the PyPI name for a path so pipx builds from source instead
+(add `--editable` to have it track the checkout live, so local edits take effect
+without reinstalling):
+
+```bash
+pipx install --editable .
+```
+
 Or from a checkout, for development:
 
 ```bash
