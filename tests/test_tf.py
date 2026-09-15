@@ -6,6 +6,7 @@ from mcap_ros2.decoder import DecoderFactory
 from mcap_ros2.writer import Writer
 
 from insta360_to_bag import msgdefs
+from insta360_to_bag.hdmapping import Pose
 from insta360_to_bag.convert import (
     BODY_TO_OPTICAL,
     DEFAULT_CAMERA_RPY,
@@ -140,3 +141,49 @@ def test_tf_static_round_trips_through_a_bag_with_latched_qos(tmp_path):
     assert transform.child_frame_id == "insta360_cam_back_optical_frame"
     assert (transform.transform.translation.x, transform.transform.translation.y,
             transform.transform.translation.z) == (1.0, 2.0, 3.0)
+
+
+# -- measured poses from a calibration file ---------------------------------
+
+
+def test_a_measured_pose_replaces_the_nominal_mount_for_that_lens():
+    pose = Pose(translation=(0.17, -0.04, -0.13), rotation=(0.5, -0.5, 0.5, 0.5))
+    transforms = static_transforms(
+        [("cam_front", "front"), ("cam_back", "back")],
+        0,
+        "lidar",
+        (9.0, 9.0, 9.0),
+        (0.0, 0.0, 0.0),
+        poses={"cam_back": pose},
+    )
+    front, back = transforms
+    # The calibrated lens ignores --camera-xyz/--camera-rpy entirely...
+    assert back["transform"]["translation"] == {"x": 0.17, "y": -0.04, "z": -0.13}
+    assert back["transform"]["rotation"] == {"x": 0.5, "y": -0.5, "z": 0.5, "w": 0.5}
+    # ...and the other one is untouched by its neighbour's calibration.
+    assert front["transform"]["translation"] == {"x": 9.0, "y": 9.0, "z": 9.0}
+    rotation = front["transform"]["rotation"]
+    assert (rotation["x"], rotation["y"], rotation["z"], rotation["w"]) == pytest.approx(
+        BODY_TO_OPTICAL["cam_front"]
+    )
+
+
+def test_measured_poses_let_the_two_lenses_sit_apart():
+    poses = {
+        "cam_front": Pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+        "cam_back": Pose((0.17, -0.04, -0.13), (0.0, 0.0, 1.0, 0.0)),
+    }
+    transforms = static_transforms(
+        [("cam_front", "front"), ("cam_back", "back")],
+        0, "lidar", (0.0, 0.0, 0.0), DEFAULT_CAMERA_RPY, poses=poses,
+    )
+    translations = [t["transform"]["translation"] for t in transforms]
+    assert translations[0] != translations[1]
+
+
+def test_an_empty_pose_map_leaves_the_nominal_mount_alone():
+    lenses = [("cam_front", "front"), ("cam_back", "back")]
+    assert static_transforms(lenses, 0, "lidar", (1.0, 2.0, 3.0), DEFAULT_CAMERA_RPY,
+                             poses={}) == static_transforms(
+        lenses, 0, "lidar", (1.0, 2.0, 3.0), DEFAULT_CAMERA_RPY
+    )

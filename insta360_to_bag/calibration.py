@@ -30,16 +30,23 @@ ROS has no such model -- sensor_msgs defines ``plumb_bob``, ``rational_polynomia
 the two agree to a fraction of a pixel; the tangential terms have no equidistant
 counterpart and are dropped, which costs a few pixels at the rim.  The fit's worst error
 is kept on each lens, and the camera's own values travel verbatim on the metadata topic.
+
+The same lens model is what HDMapping writes out after calibrating the camera against a
+lidar, so :func:`build_lens` takes unified-model intrinsics from either source and does
+the rescaling and the fit once; see :mod:`insta360_to_bag.hdmapping`.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 #: The fisheye model sensor_msgs defines: Kannala-Brandt, as used by cv::fisheye.
 DISTORTION_MODEL = "equidistant"
+
+#: Where a lens calibration came from, reported on the metadata topic and by --inspect.
+SOURCE_METADATA = "insta360 metadata offset_v2"
 
 _V2_FIELDS_PER_LENS = 19
 
@@ -76,9 +83,10 @@ class LensCalibration:
     #: Lens translation as reported by the camera: apparently metres, second lens
     #: relative to the first.
     translation: Tuple[float, float, float]
-    #: Canvas the raw values were expressed on, kept for traceability.
+    #: Image the raw values were expressed on -- the stitched canvas for metadata
+    #: calibration, the calibrated image size for an external one -- kept for traceability.
     canvas: Tuple[int, int]
-    #: Horizontal and vertical rescaling applied to get from that canvas to the frame.
+    #: Horizontal and vertical rescaling applied to get from that image to the frame.
     scale: Tuple[float, float]
     #: Equidistant (Kannala-Brandt) k1..k4 fitted to the unified model.
     equidistant: List[float]
@@ -87,6 +95,9 @@ class LensCalibration:
     #: Worst distance between the equidistant and the full unified projection within
     #: that angle, in pixels of this frame size.
     fit_error_px: float
+    #: Where these values came from: :data:`SOURCE_METADATA`, or an external
+    #: calibration that replaced it.
+    source: str = SOURCE_METADATA
 
     @property
     def equidistant_fx(self) -> float:
@@ -239,6 +250,73 @@ def _fit_equidistant(
     return coefficients, math.degrees(limit), worst
 
 
+def build_lens(
+    *,
+    index: int,
+    xi: float,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    distortion: List[float],
+    source_size: Tuple[float, float],
+    width: int,
+    height: int,
+    canvas: Optional[Tuple[int, int]] = None,
+    rotation_deg: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    translation: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    source: str = SOURCE_METADATA,
+) -> Optional[LensCalibration]:
+    """Rescale one unified-model lens onto ``width`` x ``height`` and fit an equidistant model.
+
+    ``source_size`` is the image the raw intrinsics were measured on: half the stitched
+    canvas for the camera's own calibration, the calibrated image size for an external
+    one.  Only fx, fy, cx and cy are scaled -- the distortion coefficients live on the
+    normalised plane and are size-independent.
+
+    Returns ``None`` if the values cannot make a usable lens, so that every caller
+    degrades to "no CameraInfo" rather than to silently wrong intrinsics.
+    """
+    source_width, source_height = source_size
+    if source_width <= 0 or source_height <= 0 or fx <= 0 or fy <= 0 or xi <= -1.0:
+        return None
+    if len(distortion) != 5:
+        return None
+
+    # Scale each axis independently so that a non-square output (from --scale, or a
+    # calibration measured at a different aspect ratio) still gets consistent intrinsics.
+    scale_x = width / float(source_width)
+    scale_y = height / float(source_height)
+    fx, fy = fx * scale_x, fy * scale_y
+    cx, cy = cx * scale_x, cy * scale_y
+    try:
+        equidistant, fit_angle, fit_error = _fit_equidistant(
+            xi, fx, fy, cx, cy, width, height, distortion
+        )
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+    return LensCalibration(
+        index=index,
+        width=width,
+        height=height,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        xi=xi,
+        distortion=list(distortion),
+        rotation_deg=rotation_deg,
+        translation=translation,
+        canvas=canvas or (int(source_width), int(source_height)),
+        scale=(scale_x, scale_y),
+        equidistant=equidistant,
+        fit_max_angle_deg=fit_angle,
+        fit_error_px=fit_error,
+        source=source,
+    )
+
+
 def parse_offset_v2(text: str, width: int, height: int) -> List[LensCalibration]:
     """Parse a field-54/56 calibration string, rescaled to ``width`` x ``height``.
 
@@ -270,50 +348,39 @@ def parse_offset_v2(text: str, width: int, height: int) -> List[LensCalibration]
             canvas_w, canvas_h = int(float(group[16])), int(float(group[17]))
         except ValueError:
             return []
-        if canvas_w <= 0 or canvas_h <= 0 or fx <= 0 or fy <= 0 or xi <= -1.0:
+        if canvas_w <= 0 or canvas_h <= 0:
             return []
 
-        # Each lens occupies the left or right square half of the stitched canvas.
+        # Each lens occupies the left or right square half of the stitched canvas, so
+        # its principal point has to be brought back from that half's origin.
         half_width = canvas_w / 2.0
-        # Scale each axis independently so that a non-square output (from --scale)
-        # still gets consistent intrinsics.
-        scale_x = width / half_width
-        scale_y = height / float(canvas_h)
-        fx, fy = fx * scale_x, fy * scale_y
-        cx, cy = (cx - index * half_width) * scale_x, cy * scale_y
-        try:
-            equidistant, fit_angle, fit_error = _fit_equidistant(
-                xi, fx, fy, cx, cy, width, height, distortion
-            )
-        except (ValueError, ZeroDivisionError, OverflowError):
-            return []
-        lenses.append(
-            LensCalibration(
-                index=index,
-                width=width,
-                height=height,
-                fx=fx,
-                fy=fy,
-                cx=cx,
-                cy=cy,
-                xi=xi,
-                distortion=distortion,
-                rotation_deg=(rx, ry, rz),
-                translation=(tx, ty, tz),
-                canvas=(canvas_w, canvas_h),
-                scale=(scale_x, scale_y),
-                equidistant=equidistant,
-                fit_max_angle_deg=fit_angle,
-                fit_error_px=fit_error,
-            )
+        lens = build_lens(
+            index=index,
+            xi=xi,
+            fx=fx,
+            fy=fy,
+            cx=cx - index * half_width,
+            cy=cy,
+            distortion=distortion,
+            source_size=(half_width, float(canvas_h)),
+            width=width,
+            height=height,
+            canvas=(canvas_w, canvas_h),
+            rotation_deg=(rx, ry, rz),
+            translation=(tx, ty, tz),
         )
+        if lens is None:
+            return []
+        lenses.append(lens)
     return lenses
 
 
-def summarise(lens: LensCalibration) -> str:
+def summarise(lens: LensCalibration, label: Optional[str] = None) -> str:
+    """One line describing a lens.  ``label`` replaces the default ``lens <index>``."""
     return (
-        f"lens {lens.index}: unified xi={lens.xi:g} fx={lens.fx:.2f} fy={lens.fy:.2f} "
+        f"{label or f'lens {lens.index}'}: unified xi={lens.xi:g} "
+        f"fx={lens.fx:.2f} fy={lens.fy:.2f} "
         f"cx={lens.cx:.2f} cy={lens.cy:.2f} "
-        f"(rescaled from a {lens.canvas[0]}x{lens.canvas[1]} canvas "
+        f"(rescaled from {lens.canvas[0]}x{lens.canvas[1]} "
         f"by {lens.scale[0]:.5f}x{lens.scale[1]:.5f})"
     )

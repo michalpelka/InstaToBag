@@ -57,6 +57,10 @@ insta360-to-bag capture.insv -o small.mcap --max-frames 100 --scale 0.25
 
 # IMU only
 insta360-to-bag capture.insv --no-video --no-audio --no-preview
+
+# With a measured lidar-to-camera calibration from HDMapping
+insta360-to-bag capture.insv \
+    --hdmapping-calibration cam_front.json --hdmapping-calibration cam_back.json
 ```
 
 Run `insta360-to-bag --help` for the full set. The useful ones:
@@ -71,6 +75,7 @@ Run `insta360-to-bag --help` for the full set. The useful ones:
 | `--camera-xyz X Y Z` | Camera centre in the lidar frame, metres. Default `0 0 0`. |
 | `--camera-rpy R P Y` | Camera body orientation in the lidar frame, URDF roll/pitch/yaw in degrees. Default `90 0 90`. |
 | `--lidar-frame FRAME` | Parent frame of the camera transforms. Default `lidar`. |
+| `--hdmapping-calibration [LENS=]PATH` | Use a measured HDMapping calibration for one lens. Repeatable. |
 | `--relative-time` | Start timestamps at zero instead of the capture wall clock. |
 | `--compression {zstd,lz4,none}` | MCAP chunk compression. Default `zstd`. |
 | `--topic-prefix` | Default `/insta360`. |
@@ -93,6 +98,13 @@ Run `insta360-to-bag --help` for the full set. The useful ones:
 Messages are written in strict time order, and each message's `header.stamp` equals its
 MCAP log time. `/tf_static` is never put under `--topic-prefix`, because tf listeners
 only subscribe to that exact name.
+
+The camera's **serial number**, model, firmware and capture time are also written as an
+MCAP metadata record named `insta360`, alongside the path of any calibration file used.
+That sits in the file's summary section rather than in a message, so a reader can tie a
+bag to the hardware — and so to a calibration made for that serial — without decoding
+anything: `mcap info capture.mcap` prints it, and `reader.iter_metadata()` returns it.
+The same values are on `/insta360/metadata` for consumers that only read topics.
 
 A 15.6 s 5.7K clip becomes roughly 350 MB at the default JPEG quality; conversion is
 bounded by HEVC decode of two 2880×2880 tracks.
@@ -126,6 +138,48 @@ stitching frame, whose conventions are not established (its `rz ≈ 90°` is not
 physical sensor roll). If the lenses are the wrong way round use `--swap-lenses`; to
 publish your own transforms instead, pass `--no-tf`. `insta360_imu` has no transform — see the caveats below.
 
+### Calibration from HDMapping
+
+A nominal mount is a guess about where the camera sits. If you have calibrated the rig
+with [HDMapping](https://github.com/MapsHD/HDMapping), pass its per-camera JSON instead
+and the measured pose is published verbatim:
+
+```bash
+insta360-to-bag capture.insv \
+    --hdmapping-calibration cam_front.json --hdmapping-calibration cam_back.json
+```
+
+HDMapping names each file after the camera it calibrated, so `cam_front.json` and
+`cam_back.json` need no further ceremony. For a file named anything else, say which lens
+it belongs to: `--hdmapping-calibration cam_back=2026-09-09-run3.json`.
+
+Each file replaces two things for the lens it covers:
+
+- **The pose.** `T_lidar_to_camera_4x4` takes a point from the lidar frame into the
+  camera frame, so what `/tf_static` needs is its inverse, and that is what gets
+  published. Its camera frame is the ROS optical one, which is why it drops straight in.
+  `--camera-xyz` and `--camera-rpy` no longer apply to that lens. Because each lens is
+  calibrated separately, **the two no longer share a position** — the few centimetres
+  between each optical centre and the body centre come through.
+- **The intrinsics.** HDMapping writes the same unified (Mei) model the camera reports,
+  so the values go through the same rescaling to your output frame size and the same
+  equidistant fit, and `CameraInfo` carries the calibrated numbers.
+
+Calibrate one lens and leave the other out and only that lens changes; the other stays on
+the nominal mount. `/insta360/metadata` records, per lens, which of the two it got and
+from which file, and the file paths also go into the bag's `insta360` metadata record.
+
+Checks that would otherwise pass silently are reported as warnings: a file made for a
+different serial than the capture, a rotation block that is not quite a rotation, the
+file's redundant `camera_position_in_world_xyz` disagreeing with the 4x4 it duplicates
+(the 4x4 wins), and distortion terms the three-term radial model has no place for. A file
+that cannot be read at all stops the conversion rather than quietly producing a bag
+without the calibration you asked for. `--inspect` shows what each file says, including
+the intrinsics rescaled to your frame size, before you convert anything.
+
+One thing to watch: calibrations are applied **by lens name**, and `--swap-lenses`
+changes which video track each name refers to. Using both together is warned about.
+
 ## Read it back
 
 ```bash
@@ -157,11 +211,12 @@ the tool deliberately preserves raw values instead of guessing.
   calibrated IMU-to-camera transform, so `insta360_imu` is left out of `/tf_static`.
   The per-lens rotation and translation values are passed through on the metadata
   topic.
-- **Lidar-to-camera transforms are nominal, not calibrated.** The pose is whatever
-  `--camera-xyz` and `--camera-rpy` say (by default the side mount described under
-  Frames, at the lidar origin), and both lenses share one position — the few
-  centimetres from each lens's optical centre to the body centre are not applied.
-  Calibrate the rig if you need better than that.
+- **Lidar-to-camera transforms are nominal unless you supply a calibration.** By
+  default the pose is whatever `--camera-xyz` and `--camera-rpy` say (the side mount
+  described under Frames, at the lidar origin), and both lenses share one position — the
+  few centimetres from each lens's optical centre to the body centre are not applied.
+  Calibrate the rig if you need better than that, and pass the result with
+  `--hdmapping-calibration`; the metadata topic says which of the two each lens got.
 - **CameraInfo is an `equidistant` fit, not the camera's own model.** The camera
   calibrates each lens with the unified (Mei) omnidirectional model — OpenCV's
   `omnidir`: ξ = 2, radial k1–k3, tangential p1, p2 — which ROS does not define.
@@ -173,7 +228,8 @@ the tool deliberately preserves raw values instead of guessing.
   ~4 px on the back one at the rim, at full resolution. `--inspect` prints the fit and
   its error for your file. The unified parameters are on `/insta360/metadata`, next to
   the raw calibration strings. A pinhole rectification can show at most the central
-  < 180° of a ~200° lens.
+  < 180° of a ~200° lens. An HDMapping calibration uses the same model, so it is fitted
+  the same way and carries the same caveat.
 - **`cam_front` / `cam_back` is naming, not a determination.** They follow the order of
   the video tracks in the file, which is stable but has not been confirmed against
   which lens physically faces the screen. Use `--swap-lenses` if you need them the
@@ -258,9 +314,10 @@ checks. `--inspect` prints the mean magnitude so you can confirm it on your own 
 .venv/bin/python -m pytest
 ```
 
-167 tests. Format parsers are tested against byte-exact synthetic trailers and
-protobuf messages rather than mocks, so a change in format understanding fails a test.
-Tests that need the sample capture or `ffmpeg` skip themselves when either is absent.
+224 tests. Format parsers are tested against byte-exact synthetic trailers, protobuf
+messages and real calibration files rather than mocks, so a change in format
+understanding fails a test. Tests that need the sample capture or `ffmpeg` skip
+themselves when either is absent.
 
 If you run them inside a sourced ROS environment and hit import errors from ROS's own
 pytest plugins, clear `PYTHONPATH` for the run: `env PYTHONPATH= .venv/bin/python -m pytest`.
@@ -273,6 +330,7 @@ pytest plugins, clear `PYTHONPATH` for the run: `env PYTHONPATH= .venv/bin/pytho
 | `protobuf.py` | Dependency-free protobuf wire decoder (the camera ships no schema) |
 | `metadata.py` | Typed view over record `0x0101`, including the wall-clock mapping |
 | `calibration.py` | Lens calibration strings → rescaled unified-model intrinsics and their equidistant fit |
+| `hdmapping.py` | HDMapping calibration JSON → measured lidar-to-camera pose and intrinsics |
 | `sensors.py` | IMU, exposure and preview record decoding |
 | `media.py` | ffmpeg pipes for frames and audio, plus JPEG framing |
 | `msgdefs.py` | Embedded ROS 2 message definitions |

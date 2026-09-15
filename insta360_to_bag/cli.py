@@ -6,11 +6,18 @@ import argparse
 import datetime as dt
 import os
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from . import media, metadata as metadata_mod, sensors, trailer as trailer_mod
+from . import hdmapping, media, metadata as metadata_mod, sensors, trailer as trailer_mod
 from .calibration import summarise
-from .convert import COMPRESSION, DEFAULT_CAMERA_RPY, Options, convert, resolve_scale
+from .convert import (
+    COMPRESSION,
+    DEFAULT_CAMERA_RPY,
+    LENS_NAMES,
+    Options,
+    convert,
+    resolve_scale,
+)
 
 DESCRIPTION = """\
 Convert an Insta360 .insv capture into a ROS 2 MCAP bag.
@@ -98,6 +105,15 @@ def build_parser() -> argparse.ArgumentParser:
              "Upright with the front lens looking left is 0 0 90",
     )
 
+    group.add_argument(
+        "--hdmapping-calibration", action="append", default=[], metavar="[LENS=]PATH",
+        help="an HDMapping camera calibration JSON, replacing both the nominal mount "
+             "above and the camera's own intrinsics for the lens it covers; repeat for "
+             f"the other lens. LENS is one of {', '.join(LENS_NAMES)} and may be left "
+             "off when the file is named after it, as HDMapping writes it "
+             "(cam_front.json)",
+    )
+
     group = parser.add_argument_group("output format")
     group.add_argument(
         "--topic-prefix", default="/insta360",
@@ -129,7 +145,80 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _inspect(path: str) -> int:
+def parse_calibration_args(specs: List[str]) -> Dict[str, str]:
+    """Resolve ``[LENS=]PATH`` arguments onto lens names.
+
+    Without an explicit ``LENS=``, the file's own name decides -- HDMapping names each
+    file after the camera it calibrated, so ``cam_front.json`` needs no prefix.  A name
+    that cannot be resolved is an error rather than a guess: silently calibrating the
+    wrong lens would look entirely plausible in the bag.
+    """
+    resolved: Dict[str, str] = {}
+    for spec in specs:
+        name, separator, path = spec.partition("=")
+        if not separator or name not in LENS_NAMES:
+            # Not a LENS= prefix, so the whole thing is a path (which may contain '=').
+            path = spec
+            name = os.path.splitext(os.path.basename(path))[0]
+            if name not in LENS_NAMES:
+                raise ValueError(
+                    f"could not tell which lens {spec!r} is for; name the file after "
+                    f"its lens ({', '.join(n + '.json' for n in LENS_NAMES)}) or pass "
+                    f"it as LENS=PATH with LENS one of {', '.join(LENS_NAMES)}"
+                )
+        if not path:
+            raise ValueError(f"no path given in --hdmapping-calibration {spec!r}")
+        if name in resolved:
+            raise ValueError(f"two calibration files given for {name}")
+        if not os.path.exists(path):
+            raise ValueError(f"calibration file not found: {path}")
+        resolved[name] = path
+    return resolved
+
+
+def _print_external_calibration(
+    calibrations: Dict[str, str], meta: metadata_mod.Metadata
+) -> None:
+    print()
+    print("external calibration")
+    for name, path in sorted(calibrations.items()):
+        print(f"  {name}  {path}")
+        try:
+            calibration = hdmapping.load(path)
+        except hdmapping.CalibrationError as exc:
+            print(f"    unreadable: {exc}")
+            continue
+        serial = calibration.serial or "?"
+        matches = (
+            "" if not meta.serial or not calibration.serial
+            else ("  (matches this capture)" if calibration.serial == meta.serial
+                  else f"  (this capture is {meta.serial})")
+        )
+        print(f"    for {calibration.model or '?'} serial {serial}{matches}")
+        x, y, z = calibration.pose.translation
+        qx, qy, qz, qw = calibration.pose.rotation
+        print(f"    optical frame in the lidar frame: xyz {x:.4f} {y:.4f} {z:.4f}, "
+              f"xyzw {qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}")
+        lens = (
+            None if not meta.width or not meta.height
+            else calibration.lens(0, meta.width, meta.height)
+        )
+        if lens is None:
+            print(f"    unified xi={calibration.xi:g} fx={calibration.fx:.2f} "
+                  f"fy={calibration.fy:.2f} cx={calibration.cx:.2f} "
+                  f"cy={calibration.cy:.2f} on {calibration.width}x{calibration.height}")
+        else:
+            print(f"    {summarise(lens, label='intrinsics')}")
+            print(f"    published as equidistant fx={lens.equidistant_fx:.2f} "
+                  f"fy={lens.equidistant_fy:.2f} "
+                  f"k1..k4 {[round(c, 8) for c in lens.equidistant]}")
+            print(f"    fit within {lens.fit_error_px:.2f} px out to "
+                  f"{lens.fit_max_angle_deg:.1f} deg off-axis")
+        for problem in calibration.warnings:
+            print(f"    warning: {problem}")
+
+
+def _inspect(path: str, calibrations: Dict[str, str]) -> int:
     with trailer_mod.Trailer(path) as trailer:
         meta = metadata_mod.parse(trailer.read(trailer_mod.REC_METADATA))
         probe = media.probe(path)
@@ -214,6 +303,9 @@ def _inspect(path: str) -> int:
                 print(f"    fit within {lens.fit_error_px:.2f} px out to "
                       f"{lens.fit_max_angle_deg:.1f} deg off-axis")
 
+        if calibrations:
+            _print_external_calibration(calibrations, meta)
+
         problems = trailer.footer_mismatches()
         if problems:
             print()
@@ -236,9 +328,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    try:
+        calibrations = parse_calibration_args(args.hdmapping_calibration)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if args.inspect:
         try:
-            return _inspect(args.input)
+            return _inspect(args.input, calibrations)
         except (trailer_mod.TrailerError, media.FFmpegError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -281,6 +378,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         lidar_frame=args.lidar_frame,
         camera_xyz=tuple(args.camera_xyz),
         camera_rpy=tuple(args.camera_rpy),
+        hdmapping_calibration=calibrations,
     )
 
     log = (lambda _: None) if args.quiet else (lambda message: print(message, flush=True))

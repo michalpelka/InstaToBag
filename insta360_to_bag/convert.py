@@ -12,8 +12,20 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from mcap.writer import CompressionType
 from mcap_ros2.writer import Writer
 
-from . import media, metadata as metadata_mod, msgdefs, sensors, trailer as trailer_mod
-from .calibration import DISTORTION_MODEL, LensCalibration, parse_offset_v2
+from . import (
+    hdmapping,
+    media,
+    metadata as metadata_mod,
+    msgdefs,
+    sensors,
+    trailer as trailer_mod,
+)
+from .calibration import (
+    DISTORTION_MODEL,
+    SOURCE_METADATA,
+    LensCalibration,
+    parse_offset_v2,
+)
 
 COMPRESSION = {
     "none": CompressionType.NONE,
@@ -62,6 +74,14 @@ BODY_TO_OPTICAL = {
 #: left (+y), back lens right (-y).  An upright camera with the front lens looking left
 #: is (0, 0, 90).
 DEFAULT_CAMERA_RPY = (90.0, 0.0, 90.0)
+
+#: Name of the MCAP metadata record carrying the camera's identity, so that a reader can
+#: tie a bag to the hardware (and to a calibration made for it) without decoding any
+#: message.  ``mcap info`` and the mcap libraries expose it directly.
+CAMERA_METADATA_RECORD = "insta360"
+
+#: How each lens's published pose was arrived at, reported on the metadata topic.
+_NOMINAL_EXTRINSICS = "nominal, from --camera-xyz and --camera-rpy"
 
 #: rosbag2 reads a channel's QoS from this metadata; transient-local durability is what
 #: makes ``ros2 bag play`` latch /tf_static for listeners that start late.  Policies are
@@ -118,6 +138,9 @@ class Options:
     camera_xyz: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     #: Camera body orientation in ``lidar_frame``: roll, pitch, yaw in degrees.
     camera_rpy: Tuple[float, float, float] = DEFAULT_CAMERA_RPY
+    #: HDMapping calibration files by lens name, replacing both the metadata intrinsics
+    #: and the nominal mount above for the lenses they cover.
+    hdmapping_calibration: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -299,10 +322,26 @@ def convert(options: Options, log: Callable[[str], None] = lambda _: None) -> Su
         if options.swap_lenses:
             lens_order.reverse()
         lenses = _lens_calibration(meta, out_width, out_height, summary)
+        external = _external_calibration(options, meta, summary)
 
         cameras: List[_Camera] = []
         for slot, video_index in enumerate(lens_order[: len(LENS_NAMES)]):
             name = LENS_NAMES[slot]
+            calibration = lenses.get(video_index)
+            # Taken out of the map, so that whatever is left over at the end names a
+            # calibration this capture has no lens for.
+            calibrated = external.pop(name, None)
+            pose = None
+            if calibrated is not None:
+                pose = calibrated.pose
+                replacement = calibrated.lens(video_index, out_width, out_height)
+                if replacement is None:
+                    summary.warnings.append(
+                        f"{calibrated.path}: its intrinsics could not be rescaled to "
+                        f"{out_width}x{out_height}; the camera's own are used for {name}"
+                    )
+                else:
+                    calibration = replacement
             cameras.append(
                 _Camera(
                     name=name,
@@ -312,9 +351,32 @@ def convert(options: Options, log: Callable[[str], None] = lambda _: None) -> Su
                     frame_id=f"insta360_{name}_optical_frame",
                     width=out_width,
                     height=out_height,
-                    calibration=lenses.get(video_index),
+                    calibration=calibration,
+                    pose=pose,
+                    calibration_path=None if calibrated is None else calibrated.path,
                 )
             )
+        for name, unused in sorted(external.items()):
+            summary.warnings.append(
+                f"{unused.path}: this file has no {name} to apply to "
+                f"({len(probe.video)} video stream(s) in the capture)"
+            )
+
+        # The transforms are needed whether or not they are published: the metadata
+        # topic reports the geometry the CameraInfo above is expressed in.
+        tf_time = time_of(origin_us)
+        transforms = static_transforms(
+            [(camera.name, camera.frame_id) for camera in cameras],
+            tf_time,
+            options.lidar_frame,
+            options.camera_xyz,
+            options.camera_rpy,
+            poses={
+                camera.name: camera.pose
+                for camera in cameras
+                if camera.pose is not None
+            },
+        )
 
         # -- writer --------------------------------------------------------
         output = stack.enter_context(open(options.output_path, "wb"))
@@ -327,6 +389,7 @@ def convert(options: Options, log: Callable[[str], None] = lambda _: None) -> Su
             name: writer.register_msgdef(name, definition)
             for name, definition in msgdefs.DEFINITIONS.items()
         }
+        _write_camera_metadata(writer, meta, cameras)
 
         streams: List[Iterator[Emit]] = []
 
@@ -338,13 +401,18 @@ def convert(options: Options, log: Callable[[str], None] = lambda _: None) -> Su
                 0,
                 f"{options.topic_prefix}/metadata",
                 msgdefs.STRING,
-                {"data": json.dumps(_metadata_payload(meta, cameras), indent=2, sort_keys=True)},
+                {
+                    "data": json.dumps(
+                        _metadata_payload(meta, cameras, options, transforms),
+                        indent=2,
+                        sort_keys=True,
+                    )
+                },
             )])
         )
 
-        if options.include_tf and cameras:
+        if options.include_tf and transforms:
             _register_latched_channel(writer, TF_STATIC_TOPIC, schemas[msgdefs.TF_MESSAGE])
-            tf_time = time_of(origin_us)
             streams.append(
                 iter([(
                     tf_time,
@@ -352,15 +420,7 @@ def convert(options: Options, log: Callable[[str], None] = lambda _: None) -> Su
                     0,
                     TF_STATIC_TOPIC,
                     msgdefs.TF_MESSAGE,
-                    {
-                        "transforms": static_transforms(
-                            [(camera.name, camera.frame_id) for camera in cameras],
-                            tf_time,
-                            options.lidar_frame,
-                            options.camera_xyz,
-                            options.camera_rpy,
-                        )
-                    },
+                    {"transforms": transforms},
                 )])
             )
 
@@ -492,6 +552,34 @@ class _Camera:
     width: int
     height: int
     calibration: Optional[LensCalibration]
+    #: Measured pose in the lidar frame, when an external calibration supplied one;
+    #: ``None`` leaves this lens on the nominal mount.
+    pose: Optional[hdmapping.Pose] = None
+    #: The external calibration file this lens came from, if any.
+    calibration_path: Optional[str] = None
+
+
+def _write_camera_metadata(
+    writer: Writer, meta: metadata_mod.Metadata, cameras: List[_Camera]
+) -> None:
+    """Record the camera's identity as an MCAP metadata record.
+
+    The same values ride on the metadata topic, but a metadata record is readable from
+    the summary section without decoding a message -- ``mcap info`` prints it -- which is
+    what lets a consumer match a bag to the hardware, and so to a calibration made for
+    that serial.  mcap_ros2's Writer has no metadata call of its own, so this goes
+    through the mcap writer underneath it, as ``_register_latched_channel`` does.
+    """
+    record = {
+        "serial": meta.serial or "",
+        "model": meta.model or "",
+        "firmware": meta.firmware or "",
+        "captured": meta.capture_datetime or "",
+    }
+    for camera in cameras:
+        if camera.calibration_path:
+            record[f"{camera.name}_calibration"] = camera.calibration_path
+    writer._writer.add_metadata(CAMERA_METADATA_RECORD, record)
 
 
 def _lens_calibration(
@@ -513,14 +601,57 @@ def _lens_calibration(
     return {lens.index: lens for lens in lenses}
 
 
+def _external_calibration(
+    options: Options, meta: metadata_mod.Metadata, summary: Summary
+) -> Dict[str, hdmapping.CameraCalibration]:
+    """Load the ``--hdmapping-calibration`` files, keyed by the lens name each covers.
+
+    A file that cannot be read stops the conversion -- being handed a calibration and
+    quietly converting without it is the one outcome nobody wants.  Everything that
+    leaves the numbers usable is a warning instead.
+    """
+    unknown = sorted(set(options.hdmapping_calibration) - set(LENS_NAMES))
+    if unknown:
+        raise ValueError(
+            f"no such lens: {', '.join(unknown)}; "
+            f"calibration names must be one of {', '.join(LENS_NAMES)}"
+        )
+    if options.hdmapping_calibration and options.swap_lenses:
+        summary.warnings.append(
+            "--swap-lenses exchanges which video track each lens name refers to, while "
+            "calibration files are applied by name; check that each file still matches "
+            "the lens it is named for"
+        )
+
+    loaded: Dict[str, hdmapping.CameraCalibration] = {}
+    for name, path in sorted(options.hdmapping_calibration.items()):
+        calibration = hdmapping.load(path)
+        for problem in calibration.warnings:
+            summary.warnings.append(f"{path}: {problem}")
+        if calibration.serial and meta.serial and calibration.serial != meta.serial:
+            summary.warnings.append(
+                f"{path} was made for serial {calibration.serial}, but this capture is "
+                f"from {meta.serial}; applied to {name} as asked"
+            )
+        loaded[name] = calibration
+    return loaded
+
+
 def _metadata_payload(
-    meta: metadata_mod.Metadata, cameras: List[_Camera]
+    meta: metadata_mod.Metadata,
+    cameras: List[_Camera],
+    options: Options,
+    transforms: List[Dict[str, object]],
 ) -> Dict[str, object]:
     payload = meta.as_dict()
     payload["imu"] = {
         "frame_id": "insta360_imu",
         "units": "linear_acceleration in m/s^2, angular_velocity in rad/s",
         "axes": "raw sensor axes, NOT rotated into REP 103",
+    }
+    published = {
+        transform["child_frame_id"]: transform["transform"]  # type: ignore[index]
+        for transform in transforms
     }
     payload["lenses"] = [
         {
@@ -529,11 +660,22 @@ def _metadata_payload(
             "video_stream_index": camera.video_index,
             "width": camera.width,
             "height": camera.height,
+            "extrinsics": None
+            if camera.frame_id not in published
+            else {
+                "parent_frame": options.lidar_frame,
+                "calibration_source": _NOMINAL_EXTRINSICS
+                if camera.calibration_path is None
+                else f"hdmapping {camera.calibration_path}",
+                "published_on": TF_STATIC_TOPIC if options.include_tf else None,
+                "transform": published[camera.frame_id],
+            },
             "intrinsics": None
             if camera.calibration is None
             else {
                 # What CameraInfo publishes.
                 "distortion_model": DISTORTION_MODEL,
+                "calibration_source": camera.calibration.source,
                 "fx": camera.calibration.equidistant_fx,
                 "fy": camera.calibration.equidistant_fy,
                 "cx": camera.calibration.cx,
@@ -551,8 +693,14 @@ def _metadata_payload(
                     "cy": camera.calibration.cy,
                     "k1_k2_k3_p1_p2": camera.calibration.distortion,
                 },
-                "rotation_deg": list(camera.calibration.rotation_deg),
-                "translation": list(camera.calibration.translation),
+                # The camera's own per-lens stitching pose, which only its own
+                # calibration carries.  Not a sensor pose: see the README on frames.
+                "rotation_deg": None
+                if camera.calibration.source != SOURCE_METADATA
+                else list(camera.calibration.rotation_deg),
+                "translation": None
+                if camera.calibration.source != SOURCE_METADATA
+                else list(camera.calibration.translation),
             },
         }
         for camera in cameras
@@ -595,27 +743,37 @@ def static_transforms(
     parent_frame: str,
     camera_xyz: Tuple[float, float, float],
     camera_rpy_deg: Tuple[float, float, float],
+    poses: Optional[Dict[str, hdmapping.Pose]] = None,
 ) -> List[Dict[str, object]]:
     """Build a ``geometry_msgs/TransformStamped`` from ``parent_frame`` to each lens.
 
-    ``lenses`` pairs a name from :data:`LENS_NAMES` with its optical frame id.  The
-    camera body sits at ``camera_xyz`` (metres) turned by ``camera_rpy_deg`` in the
-    parent frame, and each lens's rotation is that mount composed with
-    :data:`BODY_TO_OPTICAL`.  Both lenses share the body's position: the offset from
-    each lens's optical centre to the body centre is not in the metadata in metric
-    units, so it is not guessed.
+    ``lenses`` pairs a name from :data:`LENS_NAMES` with its optical frame id.  A lens
+    named in ``poses`` gets that measured pose verbatim, which is how a calibration file
+    reaches the bag.  Any other lens falls back to the nominal mount: the camera body
+    sits at ``camera_xyz`` (metres) turned by ``camera_rpy_deg`` in the parent frame, and
+    the lens's rotation is that mount composed with :data:`BODY_TO_OPTICAL`.  Nominal
+    lenses share the body's position, because the offset from each lens's optical centre
+    to the body centre is not in the metadata in metric units, so it is not guessed --
+    a measured pose does carry it, and then the two lenses differ.
     """
     x, y, z = camera_xyz
     mount = _quaternion_from_rpy(*(math.radians(angle) for angle in camera_rpy_deg))
     transforms: List[Dict[str, object]] = []
     for name, frame_id in lenses:
-        qx, qy, qz, qw = _quaternion_multiply(mount, BODY_TO_OPTICAL[name])
+        pose = (poses or {}).get(name)
+        if pose is None:
+            translation = (x, y, z)
+            rotation = _quaternion_multiply(mount, BODY_TO_OPTICAL[name])
+        else:
+            translation, rotation = pose.translation, pose.rotation
+        tx, ty, tz = translation
+        qx, qy, qz, qw = rotation
         transforms.append(
             {
                 "header": _header(log_time_ns, parent_frame),
                 "child_frame_id": frame_id,
                 "transform": {
-                    "translation": {"x": x, "y": y, "z": z},
+                    "translation": {"x": tx, "y": ty, "z": tz},
                     "rotation": {"x": qx, "y": qy, "z": qz, "w": qw},
                 },
             }

@@ -4,14 +4,7 @@ import pytest
 
 from insta360_to_bag.calibration import DISTORTION_MODEL, parse_offset_v2, summarise
 
-# Verbatim from an Insta360 X5 capture (metadata field 54).
-X5_OFFSET_V2 = (
-    "2_2.000000_4299.640_4299.070_2697.020_2681.800_0.196_-0.027_89.717_"
-    "0.000000_0.000000_0.000000_0.18967018_2.06612277_-3.31555128_0.00052395_"
-    "0.00003870_10752_5376_113_2.000000_4273.430_4273.780_8083.250_2666.280_"
-    "-0.136_-0.096_90.887_0.002375_-0.000169_-0.031969_0.19482063_1.98416793_"
-    "-3.08075333_0.00059304_0.00104311_10752_5376_113_197632"
-)
+from conftest import X5_OFFSET_V2
 
 
 def test_parses_both_lenses():

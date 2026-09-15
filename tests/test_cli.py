@@ -3,7 +3,12 @@ import shutil
 
 import pytest
 
-from insta360_to_bag.cli import _human_bytes, build_parser, main
+from insta360_to_bag.cli import (
+    _human_bytes,
+    build_parser,
+    main,
+    parse_calibration_args,
+)
 
 from conftest import REAL_CAPTURE, requires_real_capture
 
@@ -149,3 +154,72 @@ def test_force_overwrites_and_quiet_suppresses_progress(tmp_path, capsys):
     assert code == 0
     assert output.read_bytes()[:4] != b"stal"
     assert capsys.readouterr().out == ""
+
+
+# -- external calibration arguments -----------------------------------------
+
+
+def test_calibration_defaults_to_none_given():
+    assert build_parser().parse_args(["in.insv"]).hdmapping_calibration == []
+    assert parse_calibration_args([]) == {}
+
+
+def test_a_file_named_after_its_lens_needs_no_prefix(tmp_path):
+    front = tmp_path / "cam_front.json"
+    back = tmp_path / "cam_back.json"
+    front.write_text("{}")
+    back.write_text("{}")
+    assert parse_calibration_args([str(front), str(back)]) == {
+        "cam_front": str(front),
+        "cam_back": str(back),
+    }
+
+
+def test_an_explicit_lens_prefix_overrides_the_file_name(tmp_path):
+    path = tmp_path / "2026-09-09-run3.json"
+    path.write_text("{}")
+    assert parse_calibration_args([f"cam_back={path}"]) == {"cam_back": str(path)}
+
+
+def test_a_path_holding_an_equals_sign_is_still_a_path(tmp_path):
+    directory = tmp_path / "run=3"
+    directory.mkdir()
+    path = directory / "cam_front.json"
+    path.write_text("{}")
+    assert parse_calibration_args([str(path)]) == {"cam_front": str(path)}
+
+
+def test_a_file_whose_lens_cannot_be_told_is_an_error(tmp_path):
+    path = tmp_path / "calibration.json"
+    path.write_text("{}")
+    with pytest.raises(ValueError, match="could not tell which lens"):
+        parse_calibration_args([str(path)])
+
+
+def test_an_unknown_lens_name_is_an_error(tmp_path):
+    path = tmp_path / "x.json"
+    path.write_text("{}")
+    with pytest.raises(ValueError, match="could not tell which lens"):
+        parse_calibration_args([f"cam_left={path}"])
+
+
+def test_two_files_for_one_lens_is_an_error(tmp_path):
+    first = tmp_path / "cam_front.json"
+    second = tmp_path / "other.json"
+    first.write_text("{}")
+    second.write_text("{}")
+    with pytest.raises(ValueError, match="two calibration files"):
+        parse_calibration_args([str(first), f"cam_front={second}"])
+
+
+def test_a_missing_calibration_file_is_an_error(tmp_path):
+    with pytest.raises(ValueError, match="not found"):
+        parse_calibration_args([str(tmp_path / "cam_front.json")])
+
+
+def test_a_bad_calibration_argument_is_reported_before_any_work(tmp_path, capsys):
+    source = tmp_path / "x.insv"
+    source.write_bytes(b"\x00" * 128)
+    with pytest.raises(SystemExit):
+        main([str(source), "--hdmapping-calibration", str(tmp_path / "cam_front.json")])
+    assert "not found" in capsys.readouterr().err
